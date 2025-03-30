@@ -28,7 +28,7 @@ This guide provides a structured learning path to understand S4 (Structured Stat
 ### 3️⃣ Mamba Architecture
 **Goal**: Understand how Mamba builds upon and improves SSMs
 
-- 📖 Read [Part 3: Visual Guide to Mamba](https://newsletter.maartengrootendorst.com/i/141228095/part-the-problem-with-transformers)
+- 📖 Read [Part 3: Visual Guide to Mamba](https://newsletter.maartengrootendorst.com/i/141228095/part-mamba-a-selective-ssm)
   - Explains how Mamba extends and improves upon S4
 
 ### 4️⃣ Hands-On Implementation
