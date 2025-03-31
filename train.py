@@ -17,8 +17,9 @@ import math
 # ### MNIST Sequence Modeling
 # **Task**: Predict next pixel value given history, in an autoregressive fashion (784 pixels x 256 values).
 #
-def create_mnist_dataset(bsz=128):
+def create_mnist_dataset(bsz=128, subset_size=1000):
     print("[*] Generating MNIST Sequence Modeling Dataset...")
+    print(f"[*] Using subset of {subset_size} samples for training and testing")
 
     # Constants
     SEQ_LENGTH, N_CLASSES, IN_DIM = 784, 256, 1
@@ -32,21 +33,32 @@ def create_mnist_dataset(bsz=128):
         ]
     )
 
-    train = torchvision.datasets.MNIST(
+    # Load full datasets
+    train_full = torchvision.datasets.MNIST(
         "./data", train=True, download=True, transform=tf
     )
-    test = torchvision.datasets.MNIST(
+    test_full = torchvision.datasets.MNIST(
         "./data", train=False, download=True, transform=tf
+    )
+    
+    # Create subsets
+    train_subset = torch.utils.data.Subset(
+        train_full, 
+        indices=range(min(subset_size, len(train_full)))
+    )
+    test_subset = torch.utils.data.Subset(
+        test_full, 
+        indices=range(min(subset_size//5, len(test_full)))  # Smaller test set
     )
 
     # Return data loaders, with the provided batch size
     trainloader = DataLoader(
-        train,
+        train_subset,
         batch_size=bsz,
         shuffle=True,
     )
     testloader = DataLoader(
-        test,
+        test_subset,
         batch_size=bsz,
         shuffle=False,
     )
@@ -55,8 +67,9 @@ def create_mnist_dataset(bsz=128):
 
 # ### MNIST Classification
 # **Task**: Predict MNIST class given sequence model over pixels (784 pixels => 10 classes).
-def create_mnist_classification_dataset(bsz=128):
+def create_mnist_classification_dataset(bsz=128, subset_size=1000):
     print("[*] Generating MNIST Classification Dataset...")
+    print(f"[*] Using subset of {subset_size} samples for training and testing")
 
     # Constants
     SEQ_LENGTH, N_CLASSES, IN_DIM = 784, 10, 1
@@ -68,19 +81,30 @@ def create_mnist_classification_dataset(bsz=128):
         ]
     )
 
-    train = torchvision.datasets.MNIST(
+    # Load full datasets
+    train_full = torchvision.datasets.MNIST(
         "./data", train=True, download=True, transform=tf
     )
-    test = torchvision.datasets.MNIST(
+    test_full = torchvision.datasets.MNIST(
         "./data", train=False, download=True, transform=tf
+    )
+    
+    # Create subsets
+    train_subset = torch.utils.data.Subset(
+        train_full, 
+        indices=range(min(subset_size, len(train_full)))
+    )
+    test_subset = torch.utils.data.Subset(
+        test_full, 
+        indices=range(min(subset_size//5, len(test_full)))  # Smaller test set
     )
 
     # Return data loaders, with the provided batch size
     trainloader = DataLoader(
-        train, batch_size=bsz, shuffle=True
+        train_subset, batch_size=bsz, shuffle=True
     )
     testloader = DataLoader(
-        test, batch_size=bsz, shuffle=False
+        test_subset, batch_size=bsz, shuffle=False
     )
 
     return trainloader, testloader, N_CLASSES, SEQ_LENGTH, IN_DIM
@@ -480,12 +504,12 @@ def main(case="classification"):
             "layer": "s4",
             "seed": 1,
             "model": {
-                "d_model": 8,    # Reduced from 128
+                "d_model": 8,     # Reduced from 128
                 "n_layers": 2,    # Reduced from 4
                 "dropout": 0.25,
                 "prenorm": True,
                 "embedding": False,
-                "layer_N": 4     # Reduced from 64
+                "layer_N": 4      # Reduced from 64
             },
             "train": {
                 "epochs": 5,      # Reduced from 20
@@ -501,12 +525,12 @@ def main(case="classification"):
             "layer": "s4",
             "seed": 0,
             "model": {
-                "d_model": 8,    # Reduced from 128
+                "d_model": 8,     # Reduced from 128
                 "n_layers": 2,    # Reduced from 4
                 "dropout": 0.0,
                 "prenorm": True,
                 "embedding": False,
-                "layer_N": 4     # Reduced from 64
+                "layer_N": 4      # Reduced from 64
             },
             "train": {
                 "epochs": 5,      # Reduced from 100
