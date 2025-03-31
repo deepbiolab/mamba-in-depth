@@ -52,3 +52,34 @@ This guide provides a structured learning path to understand S4 (Structured Stat
 
 
 > 💡 **Tip**: Follow this path sequentially for the best learning experience. Each section builds upon the knowledge from previous sections.
+
+
+
+## 🚀 Implementation Example
+
+This repository contains a PyTorch implementation of the S4 (Structured State Space Sequence Model) for sequence modeling and classification tasks. The implementation focuses on the MNIST dataset with two main tasks:
+
+1. MNIST Sequence Modeling: Predict next pixel value given history (784 pixels x 256 values)
+2. MNIST Classification: Predict digit class using sequence model (784 pixels => 10 classes)
+
+### Key Components
+
+- **SSM Kernel**: Basic implementation of State Space Model kernel
+- **S4 Kernel**: Advanced implementation with HiPPO-based initialization
+- **Sequence Processing**: Layer normalization, SSM/S4 layer, and MLP components
+- **Model Architecture**: Stacked sequence model with configurable parameters
+
+### Usage
+
+```python
+# Run S4 model for both sequence modeling / classification case
+python train_s4.py
+```
+
+> Notes
+>
+> - Model uses reduced dimensions for demonstration
+> - Supports both CNN and RNN modes
+
+For detailed implementation, see [train_s4.py](./train_s4.py).
+
