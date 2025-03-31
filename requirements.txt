@@ -1,0 +1,7 @@
+flax==0.10.4
+jax==0.5.3
+numpy==2.2.4
+optax==0.2.4
+torch==2.6.0
+torchvision==0.21.0
+tqdm==4.67.1
