@@ -12,7 +12,7 @@ Paper: [Efficiently Modeling Long Sequences with Structured State Spaces](https:
 
 这篇论文是对 Transformers 的一种令人耳目一新的代替，采用了非常不同的方法来解决一个重要的问题领域。然而，我们的一些同事私下表示，理解该模型的直观感受上存在困难。这篇博客文章是朝着获得这种直观理解的目标迈出的第一步，将具体的代码实现与 S4 论文中的解释联系起来——与 [the annotated Transformer](https://nlp.seas.harvard.edu/2018/04/03/attention.html) 的风格非常相似。希望代码和通俗解释的结合能帮助您理解模型的细节。到博客结束时，您将拥有一个高效的 S4 工作版本，能够在训练时作为 CNN 操作，然后在测试时转换为高效的 RNN。
 
-![CleanShot-2025-03-30-16-49-56@2x](/Users/tim/Library/Application Support/CleanShot/media/media_jzdgPciGYi/CleanShot-2025-03-30-16-49-56@2x.png)
+![CleanShot-2025-03-30-16-49-56@2x](assets/CleanShot-2025-03-30-16-49-56@2x.png)
 
 为了预览结果，您将能够直接从标准 GPU 上的音频波生成像素和声音的图像。
 
