@@ -23,7 +23,8 @@ This guide provides a structured learning path to understand S4 (Structured Stat
 
 3. 💻 Study [The Annotated S4](https://srush.github.io/annotated-s4/#part-1b-addressing-long-range-dependencies-with-hippo)
    > Note: Since the original repo is outdated, use the [s4_in_depth.ipynb](./s4_in_depth.ipynb) notebook in this repository
-   > 对于中文读者，·我已经将原作者的The Annotated S4翻译成了中文，放在了[The-Annotated-S4-CN](.cn/The-Annotated-S4-CN.pdf)中，方便中文读者阅读。
+   >
+   > 对于中文读者，我已经将原作者的The Annotated S4翻译成了中文，放在了[cn 文件夹](.cn/The-Annotated-S4-CN-Part1.md)中，方便中文读者阅读。
 
 ### 3️⃣ Mamba Architecture
 **Goal**: Understand how Mamba builds upon and improves SSMs
