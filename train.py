@@ -3,18 +3,14 @@ from tqdm import tqdm
 from functools import partial
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
-
-import jax
-import jax.numpy as np
-from jax.scipy.signal import convolve
-from jax.nn.initializers import lecun_normal, normal
-from jax.numpy.linalg import eigh, inv, matrix_power
-
-import optax
-from flax import linen as nn
-from flax.training import train_state
+import numpy as np
+import math
 
 # =============================================================================
 # ========================= Dataset and Tasks =================================
@@ -46,12 +42,12 @@ def create_mnist_dataset(bsz=128):
     )
 
     # Return data loaders, with the provided batch size
-    trainloader = torch.utils.data.DataLoader(
+    trainloader = DataLoader(
         train,
         batch_size=bsz,
         shuffle=True,
     )
-    testloader = torch.utils.data.DataLoader(
+    testloader = DataLoader(
         test,
         batch_size=bsz,
         shuffle=False,
@@ -82,10 +78,10 @@ def create_mnist_classification_dataset(bsz=128):
     )
 
     # Return data loaders, with the provided batch size
-    trainloader = torch.utils.data.DataLoader(
+    trainloader = DataLoader(
         train, batch_size=bsz, shuffle=True
     )
-    testloader = torch.utils.data.DataLoader(
+    testloader = DataLoader(
         test, batch_size=bsz, shuffle=False
     )
 
@@ -96,219 +92,258 @@ Datasets = {
     "mnist-classification": create_mnist_classification_dataset,
 }
 
-
 # =============================================================================
 # ========================= State Space Model (SSM)  ==========================
 # =============================================================================
 
-def random_SSM(rng, N):
-    a_r, b_r, c_r = jax.random.split(rng, 3)
-    A = jax.random.uniform(a_r, (N, N))
-    B = jax.random.uniform(b_r, (N, 1))
-    C = jax.random.uniform(c_r, (1, N))
-    return A, B, C
-
-def discretize(A, B, C, step):
-    I = np.eye(A.shape[0])
-    BL = inv(I - (step / 2.0) * A)
-    Ab = BL @ (I + (step / 2.0) * A)
-    Bb = (BL * step) @ B
-    return Ab, Bb, C
-
-def scan_SSM(Ab, Bb, Cb, u, x0):
-    def step(x_k_1, u_k):
-        x_k = Ab @ x_k_1 + Bb @ u_k
-        y_k = Cb @ x_k
-        return x_k, y_k
-
-    return jax.lax.scan(step, x0, u)
-
-def run_SSM(A, B, C, u):
+class SSMKernel(nn.Module):
     """
-    Run a State Space Model (SSM).
-    
-    Parameters:
-        A: Continuous-time state matrix (NxN)
-        B: Continuous-time input matrix (Nx1)
-        C: Output matrix (1xN)
-        u: Input signal (L-dimensional vector)
-    
-    Returns:
-        The output of the state space model after running.
+    PyTorch implementation of the SSM Kernel
     """
-    L = u.shape[0]
-    N = A.shape[0]
+    def __init__(self, N, l_max, dt_min=0.001, dt_max=0.1):
+        super().__init__()
+        # SSM parameters
+        self.N = N
+        self.l_max = l_max
+        
+        # Initialize parameters with PyTorch
+        self.A = nn.Parameter(torch.randn(N, N) / math.sqrt(N))
+        self.B = nn.Parameter(torch.randn(N, 1) / math.sqrt(N))
+        self.C = nn.Parameter(torch.randn(1, N) / math.sqrt(N))
+        self.D = nn.Parameter(torch.ones(1))
+        
+        # Step parameter
+        log_dt = torch.rand(1) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        self.log_dt = nn.Parameter(log_dt)
+        
+        # Register buffer for RNN cache
+        self.register_buffer('x_k_1', torch.zeros(N))
+        
+        # Precompute kernel for CNN mode
+        self.kernel = None
+        
+    def discretize(self):
+        dt = torch.exp(self.log_dt)
+        I = torch.eye(self.N, device=self.A.device)
+        
+        # Compute the discrete-time matrices
+        BL = torch.inverse(I - (dt / 2.0) * self.A)
+        Ab = BL @ (I + (dt / 2.0) * self.A)
+        Bb = (BL * dt) @ self.B
+        
+        return Ab, Bb, self.C
     
-    # Discretize the continuous-time state space model (A, B, C)
-    # step is the discretization step size, set to 1.0 / L here
-    Ab, Bb, Cb = discretize(A, B, C, step=1.0 / L)
+    def compute_kernel(self):
+        """Compute the convolution kernel for CNN mode"""
+        Ab, Bb, C = self.discretize()
+        
+        # Compute powers of Ab for each step in the sequence
+        kernel = []
+        X = Bb
+        for l in range(self.l_max):
+            kernel.append((C @ X).reshape(-1))
+            X = Ab @ X
+            
+        return torch.stack(kernel)
     
-    # Run the recursive computation of the state space model
-    # Initial state is set to zero vector np.zeros((N,))
-    # scan_SSM returns two values, we only take the second one which is the model output
-    return scan_SSM(Ab, Bb, Cb, u[:, np.newaxis], np.zeros((N,)))[1]
+    def forward(self, u, decode=False):
+        if not decode:
+            # CNN Mode - use convolution
+            if self.kernel is None or self.training:
+                self.kernel = self.compute_kernel()
+                
+            # Implement causal convolution using PyTorch's conv1d
+            # Reshape kernel to [out_channels, in_channels, kernel_size]
+            kernel = self.kernel.reshape(1, 1, -1)
+            
+            # Pad the input for causal convolution
+            u_pad = F.pad(u.unsqueeze(0).unsqueeze(0), (self.l_max-1, 0))
+            
+            # Apply convolution and remove extra dimensions
+            y = F.conv1d(u_pad, kernel).squeeze(0).squeeze(0)
+            
+            return y + self.D * u
+        else:
+            # RNN Mode - for autoregressive generation
+            Ab, Bb, C = self.discretize()
+            x_k = self.x_k_1
+            outputs = []
+            
+            for u_t in u:
+                x_k = Ab @ x_k + Bb * u_t
+                y_k = (C @ x_k).reshape(-1)
+                outputs.append(y_k)
+                
+            # Update the cached state
+            if self.training:
+                self.x_k_1 = x_k.detach()
+                
+            return torch.stack(outputs) + self.D * u
 
-def K_conv(Ab, Bb, Cb, L):
-    return np.array(
-        [(Cb @ matrix_power(Ab, l) @ Bb).reshape() for l in range(L)]
-    )
-
-def causal_convolution(u, K, nofft=False):
-    if nofft:
-        return convolve(u, K, mode="full")[: u.shape[0]]
-    else:
-        assert K.shape[0] == u.shape[0]
-        ud = np.fft.rfft(np.pad(u, (0, K.shape[0])))
-        Kd = np.fft.rfft(np.pad(K, (0, u.shape[0])))
-        out = ud * Kd
-        return np.fft.irfft(out)[: u.shape[0]]
-    
-def log_step_initializer(dt_min=0.001, dt_max=0.1):
-    def init(key, shape):
-        return jax.random.uniform(key, shape) * (
-            np.log(dt_max) - np.log(dt_min)
-        ) + np.log(dt_min)
-
-    return init
 
 class SSMLayer(nn.Module):
-    N: int
-    l_max: int
-    decode: bool = False
-
-    def setup(self):
-        # SSM parameters
-        self.A = self.param("A", lecun_normal(), (self.N, self.N))
-        self.B = self.param("B", lecun_normal(), (self.N, 1))
-        self.C = self.param("C", lecun_normal(), (1, self.N))
-        self.D = self.param("D", nn.initializers.ones, (1,))
-
-        # Step parameter
-        self.log_step = self.param("log_step", log_step_initializer(), (1,))
-
-        step = np.exp(self.log_step)
-        self.ssm = discretize(self.A, self.B, self.C, step=step)
-        self.K = K_conv(*self.ssm, self.l_max)
-
-        # RNN cache for long sequences
-        self.x_k_1 = self.variable("cache", "cache_x_k", np.zeros, (self.N,))
-
-    def __call__(self, u):
-        if not self.decode:
-            # CNN Mode
-            return causal_convolution(u, self.K) + self.D * u
-        else:
-            # RNN Mode
-            x_k, y_s = scan_SSM(*self.ssm, u[:, np.newaxis], self.x_k_1.value)
-            if self.is_mutable_collection("cache"):
-                self.x_k_1.value = x_k
-            return y_s.reshape(-1).real + self.D * u
+    """
+    Parallel SSM layer that processes multiple channels
+    """
+    def __init__(self, d_model, N, l_max, decode=False):
+        super().__init__()
+        self.d_model = d_model
+        self.N = N
+        self.l_max = l_max
+        self.decode = decode
         
-def cloneLayer(layer):
-    return nn.vmap(
-        layer,
-        in_axes=1,
-        out_axes=1,
-        variable_axes={"params": 1, "cache": 1, "prime": 1},
-        split_rngs={"params": True},
-    )
-SSMLayer = cloneLayer(SSMLayer)
+        # Create parallel SSM kernels for each channel
+        self.ssm_kernels = nn.ModuleList([
+            SSMKernel(N, l_max) for _ in range(d_model)
+        ])
+        
+    def forward(self, x):
+        # x shape: [seq_len, batch_size, d_model]
+        seq_len, batch_size, d_model = x.shape
+        
+        # Process each batch separately
+        batch_outputs = []
+        for b in range(batch_size):
+            # Process each channel with its own SSM kernel
+            channel_outputs = []
+            for i, kernel in enumerate(self.ssm_kernels):
+                u = x[:, b, i]  # [seq_len]
+                y = kernel(u, decode=self.decode)
+                channel_outputs.append(y)
+                
+            # Stack channel outputs
+            batch_output = torch.stack(channel_outputs, dim=1)  # [seq_len, d_model]
+            batch_outputs.append(batch_output)
+            
+        # Stack batch outputs
+        return torch.stack(batch_outputs, dim=1)  # [seq_len, batch_size, d_model]
+
 
 class SequenceBlock(nn.Module):
-    layer_cls: nn.Module
-    layer: dict  # Hyperparameters of inner layer
-    dropout: float
-    d_model: int
-    prenorm: bool = True
-    glu: bool = True
-    training: bool = True
-    decode: bool = False
-
-    def setup(self):
-        self.seq = self.layer_cls(**self.layer, decode=self.decode)
-        self.norm = nn.LayerNorm()
-        self.out = nn.Dense(self.d_model)
-        if self.glu:
-            self.out2 = nn.Dense(self.d_model)
-        self.drop = nn.Dropout(
-            self.dropout,
-            broadcast_dims=[0],
-            deterministic=not self.training,
-        )
-
-    def __call__(self, x):
+    """
+    Sequence processing block with normalization, SSM layer, and MLP
+    """
+    def __init__(self, d_model, N, l_max, dropout=0.0, prenorm=True, glu=True, decode=False):
+        super().__init__()
+        self.prenorm = prenorm
+        self.glu = glu
+        
+        # Layer normalization
+        self.norm = nn.LayerNorm(d_model)
+        
+        # SSM layer
+        self.seq = SSMLayer(d_model, N, l_max, decode=decode)
+        
+        # Output projections
+        self.out = nn.Linear(d_model, d_model)
+        if glu:
+            self.out2 = nn.Linear(d_model, d_model)
+            
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # x shape: [seq_len, batch_size, d_model]
         skip = x
+        
         if self.prenorm:
             x = self.norm(x)
+            
         x = self.seq(x)
-        x = self.drop(nn.gelu(x))
+        x = self.dropout(F.gelu(x))
+        
         if self.glu:
-            x = self.out(x) * jax.nn.sigmoid(self.out2(x))
+            x = self.out(x) * torch.sigmoid(self.out2(x))
         else:
             x = self.out(x)
-        x = skip + self.drop(x)
+            
+        x = skip + self.dropout(x)
+        
         if not self.prenorm:
             x = self.norm(x)
+            
         return x
-    
-class Embedding(nn.Embed):
-    num_embeddings: int     # Vocabulary size
-    features: int           # Embedding dimension
 
-    @nn.compact
-    def __call__(self, x):
-        y = nn.Embed(self.num_embeddings, self.features)(x[..., 0])
-        return np.where(x > 0, y, 0.0)
+
+class Embedding(nn.Module):
+    """Custom embedding layer"""
+    def __init__(self, num_embeddings, embedding_dim):
+        super().__init__()
+        self.embed = nn.Embedding(num_embeddings, embedding_dim)
+        
+    def forward(self, x):
+        # x shape: [seq_len, batch_size, 1]
+        y = self.embed(x[:, :, 0].long())
+        return torch.where(x > 0, y, torch.zeros_like(y))
+
 
 class StackedModel(nn.Module):
-    layer_cls: nn.Module    # Layer class to use (e.g., SSMLayer)
-    layer: dict             # Layer configuration parameters
-    d_output: int           # Output dimension (e.g., vocab size)
-    d_model: int            # Model hidden dimension
-    n_layers: int           # Number of layers to stack
-    prenorm: bool = True    # Whether to apply normalization before layer
-    dropout: float = 0.0    # Dropout rate
-    embedding: bool = False # Whether to use embedding or dense layer for encoding
-    classification: bool = False
-    training: bool = True
-    decode: bool = False    # Decoding mode flag (for autoregressive generation)
-
-    def setup(self):
+    """
+    Complete sequence model with stacked SSM layers
+    """
+    def __init__(
+        self,
+        d_output,
+        d_model,
+        n_layers,
+        layer_N,
+        l_max,
+        prenorm=True,
+        dropout=0.0,
+        embedding=False,
+        classification=False,
+        decode=False,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.classification = classification
+        self.embedding = embedding
+        self.decode = decode
+        
         # Input encoder
-        if self.embedding:
-            # For discrete inputs (e.g., tokens)
-            self.encoder = Embedding(self.d_output, self.d_model)
+        if embedding:
+            self.encoder = Embedding(d_output, d_model)
         else:
-            # For continuous inputs
-            self.encoder = nn.Dense(self.d_model)
+            self.encoder = nn.Linear(1, d_model)
+            
+        # Stack of sequence processing layers
+        self.layers = nn.ModuleList([
+            SequenceBlock(
+                d_model=d_model,
+                N=layer_N,
+                l_max=l_max,
+                dropout=dropout,
+                prenorm=prenorm,
+                glu=True,
+                decode=decode,
+            )
+            for _ in range(n_layers)
+        ])
         
         # Output decoder
-        self.decoder = nn.Dense(self.d_output)
+        self.decoder = nn.Linear(d_model, d_output)
         
-        # Stack of sequence processing layers
-        self.layers = [
-            SequenceBlock(
-                layer_cls=self.layer_cls,
-                layer=self.layer,
-                prenorm=self.prenorm,
-                d_model=self.d_model,
-                dropout=self.dropout,
-                training=self.training,
-                decode=self.decode,
-            )
-            for _ in range(self.n_layers)
-        ]
-
-    def __call__(self, x):
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, 1]
+        
+        # Transpose to [seq_len, batch_size, 1] for sequence processing
+        x = x.transpose(0, 1)
+        
         if not self.classification:
             if not self.embedding:
                 # Normalize pixel values for image data
                 x = x / 255.0
             if not self.decode:
-                x = np.pad(x[:-1], [(1, 0), (0, 0)])
+                # Shift input for next-token prediction
+                padding = torch.zeros_like(x[0:1])
+                x = torch.cat([padding, x[:-1]], dim=0)
         
         # Encode input
-        x = self.encoder(x)
+        if self.embedding:
+            x = self.encoder(x)
+        else:
+            # Ensure x is the right shape for the linear layer
+            x = self.encoder(x)
         
         # Process through layers
         for layer in self.layers:
@@ -316,143 +351,130 @@ class StackedModel(nn.Module):
         
         if self.classification:
             # Global average pooling for classification
-            x = np.mean(x, axis=0)
+            x = torch.mean(x, dim=0)  # [batch_size, d_model]
+            # Decode to output dimension
+            x = self.decoder(x)
+        else:
+            # Transpose back to [batch_size, seq_len, d_model]
+            x = x.transpose(0, 1)
+            # Decode to output dimension
+            x = self.decoder(x)
         
-        # Decode to output dimension
-        x = self.decoder(x)
-
         # Apply log softmax for probability distribution
-        return nn.log_softmax(x, axis=-1)
+        return F.log_softmax(x, dim=-1)
 
-BatchStackedModel = nn.vmap(
-    StackedModel,
-    in_axes=0,
-    out_axes=0,
-    variable_axes={"params": None, "dropout": None, "cache": 0, "prime": None},
-    split_rngs={"params": False, "dropout": True},
-)    
 
 # =============================================================================
 # ========================= Train and Evaluate ================================
 # =============================================================================
 
+def count_parameters(model):
+    """Count trainable parameters in the model"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-@partial(np.vectorize, signature="(c),()->()")
-def cross_entropy_loss(logits, label):
-    one_hot_label = jax.nn.one_hot(label, num_classes=logits.shape[0])
-    return -np.sum(one_hot_label * logits)
+def create_optimizer(model, lr, weight_decay=0.0):
+    """Create AdamW optimizer for the model"""
+    return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-@partial(np.vectorize, signature="(c),()->()")
-def compute_accuracy(logits, label):
-    return np.argmax(logits) == label
-
-def map_nested_fn(fn):
-    def map_fn(nested_dict):
-        return {
-            k: (map_fn(v) if hasattr(v, "keys") else fn(k, v))
-            for k, v in nested_dict.items()
-        }
-    return map_fn
-
-def create_train_state(rng, model_cls, trainloader, lr, lr_layer=None, 
-                      lr_schedule=False, weight_decay=0.0, total_steps=-1):
-    model = model_cls(training=True)
-    init_rng, dropout_rng = jax.random.split(rng, num=2)
-    params = model.init(
-        {"params": init_rng, "dropout": dropout_rng},
-        np.array(next(iter(trainloader))[0].numpy()),
-    )
-    params = params["params"].unfreeze()
-
+def create_scheduler(optimizer, total_steps, lr_schedule=False):
+    """Create learning rate scheduler if requested"""
     if lr_schedule:
-        schedule_fn = lambda lr: optax.cosine_onecycle_schedule(
-            peak_value=lr,
-            transition_steps=total_steps,
+        return optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=optimizer.param_groups[0]['lr'],
+            total_steps=total_steps,
             pct_start=0.1,
+            anneal_strategy='cos',
         )
+    return None
+
+def train_step(model, optimizer, scheduler, inputs, labels, classification=False):
+    """Perform one training step"""
+    model.train()
+    optimizer.zero_grad()
+    
+    # Forward pass
+    logits = model(inputs)
+    
+    # Compute loss
+    if not classification:
+        # For sequence modeling, labels are the input pixels
+        labels = inputs[:, :, 0].long()
+        # For sequence modeling, logits are [batch_size, seq_len, n_classes]
+        loss = F.nll_loss(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+        pred = logits.argmax(dim=-1)
+        acc = (pred == labels).float().mean()
     else:
-        schedule_fn = lambda lr: lr
+        # For classification, logits are [batch_size, n_classes]
+        loss = F.nll_loss(logits, labels)
+        pred = logits.argmax(dim=1)
+        acc = (pred == labels).float().mean()
     
-    if lr_layer is None:
-        lr_layer = {}
-
-    optimizers = {
-        k: optax.adam(learning_rate=schedule_fn(v * lr))
-        for k, v in lr_layer.items()
-    }
-    optimizers["__default__"] = optax.adamw(
-        learning_rate=schedule_fn(lr),
-        weight_decay=weight_decay,
-    )
+    # Backward pass and optimization
+    loss.backward()
+    optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
     
-    name_map = map_nested_fn(lambda k, _: k if k in lr_layer else "__default__")
-    tx = optax.multi_transform(optimizers, name_map)
+    return loss.item(), acc.item()
 
-    param_sizes = map_nested_fn(
-        lambda k, param: param.size * (2 if param.dtype in [np.complex64, np.complex128] else 1)
-        if lr_layer.get(k, lr) > 0.0 else 0
-    )(params)
-    print(f"[*] Trainable Parameters: {sum(jax.tree_leaves(param_sizes))}")
-    print(f"[*] Total training steps: {total_steps}")
+def eval_step(model, inputs, labels, classification=False):
+    """Perform one evaluation step"""
+    model.eval()
+    
+    with torch.no_grad():
+        # Forward pass
+        logits = model(inputs)
+        
+        # Compute loss
+        if not classification:
+            # For sequence modeling, labels are the input pixels
+            labels = inputs[:, :, 0].long()
+            # For sequence modeling, logits are [batch_size, seq_len, n_classes]
+            loss = F.nll_loss(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+            pred = logits.argmax(dim=-1)
+            acc = (pred == labels).float().mean()
+        else:
+            # For classification, logits are [batch_size, n_classes]
+            loss = F.nll_loss(logits, labels)
+            pred = logits.argmax(dim=1)
+            acc = (pred == labels).float().mean()
+    
+    return loss.item(), acc.item()
 
-    return train_state.TrainState.create(
-        apply_fn=model.apply, params=params, tx=tx
-    )
-
-@partial(jax.jit, static_argnums=(4, 5))
-def train_step(state, rng, batch_inputs, batch_labels, model, classification=False):
-    def loss_fn(params):
-        logits, mod_vars = model.apply(
-            {"params": params},
-            batch_inputs,
-            rngs={"dropout": rng},
-            mutable=["intermediates"],
-        )
-        loss = np.mean(cross_entropy_loss(logits, batch_labels))
-        acc = np.mean(compute_accuracy(logits, batch_labels))
-        return loss, (logits, acc)
-
-    if not classification:
-        batch_labels = batch_inputs[:, :, 0]
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (logits, acc)), grads = grad_fn(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state, loss, acc
-
-@partial(jax.jit, static_argnums=(3, 4))
-def eval_step(batch_inputs, batch_labels, params, model, classification=False):
-    if not classification:
-        batch_labels = batch_inputs[:, :, 0]
-    logits = model.apply({"params": params}, batch_inputs)
-    loss = np.mean(cross_entropy_loss(logits, batch_labels))
-    acc = np.mean(compute_accuracy(logits, batch_labels))
-    return loss, acc
-
-def train_epoch(state, rng, model, trainloader, classification=False):
-    model = model(training=True)
+def train_epoch(model, optimizer, scheduler, trainloader, classification=False, device='cuda'):
+    """Train for one epoch"""
     batch_losses, batch_accuracies = [], []
+    
     for batch_idx, (inputs, labels) in enumerate(tqdm(trainloader)):
-        inputs = np.array(inputs.numpy())
-        labels = np.array(labels.numpy())
-        rng, drop_rng = jax.random.split(rng)
-        state, loss, acc = train_step(state, drop_rng, inputs, labels, model, classification)
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        
+        loss, acc = train_step(model, optimizer, scheduler, inputs, labels, classification)
         batch_losses.append(loss)
         batch_accuracies.append(acc)
-    return state, np.mean(np.array(batch_losses)), np.mean(np.array(batch_accuracies))
+    
+    return np.mean(batch_losses), np.mean(batch_accuracies)
 
-def validate(params, model, testloader, classification=False):
-    model = model(training=False)
+def validate(model, testloader, classification=False, device='cuda'):
+    """Validate the model"""
     losses, accuracies = [], []
+    
     for batch_idx, (inputs, labels) in enumerate(tqdm(testloader)):
-        inputs = np.array(inputs.numpy())
-        labels = np.array(labels.numpy())
-        loss, acc = eval_step(inputs, labels, params, model, classification)
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        
+        loss, acc = eval_step(model, inputs, labels, classification)
         losses.append(loss)
         accuracies.append(acc)
-    return np.mean(np.array(losses)), np.mean(np.array(accuracies))
+    
+    return np.mean(losses), np.mean(accuracies)
 
 def main(case="classification"):
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
     # Configuration for the two cases
     if case == "classification":
         config = {
@@ -460,16 +482,16 @@ def main(case="classification"):
             "layer": "s4",
             "seed": 1,
             "model": {
-                "d_model": 128,
-                "n_layers": 4,
+                "d_model": 8,    # Reduced from 128
+                "n_layers": 2,    # Reduced from 4
                 "dropout": 0.25,
                 "prenorm": True,
                 "embedding": False,
-                "layer": {"N": 64}
+                "layer_N": 4     # Reduced from 64
             },
             "train": {
-                "epochs": 20,
-                "bsz": 128,
+                "epochs": 5,      # Reduced from 20
+                "bsz": 64,        # Reduced from 128
                 "lr": 0.005,
                 "lr_schedule": True,
                 "weight_decay": 0.01
@@ -481,16 +503,16 @@ def main(case="classification"):
             "layer": "s4",
             "seed": 0,
             "model": {
-                "d_model": 128,
-                "n_layers": 4,
+                "d_model": 8,    # Reduced from 128
+                "n_layers": 2,    # Reduced from 4
                 "dropout": 0.0,
                 "prenorm": True,
                 "embedding": False,
-                "layer": {"N": 64}
+                "layer_N": 4     # Reduced from 64
             },
             "train": {
-                "epochs": 100,
-                "bsz": 128,
+                "epochs": 5,      # Reduced from 100
+                "bsz": 64,        # Reduced from 128
                 "lr": 0.001,
                 "lr_schedule": False,
                 "weight_decay": 0.01
@@ -498,9 +520,9 @@ def main(case="classification"):
         }
 
     # Set randomness
-    torch.random.manual_seed(config["seed"])
-    key = jax.random.PRNGKey(config["seed"])
-    key, rng, train_rng = jax.random.split(key, num=3)
+    torch.manual_seed(config["seed"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config["seed"])
 
     # Setup dataset
     classification = "classification" in config["dataset"]
@@ -509,39 +531,52 @@ def main(case="classification"):
         bsz=config["train"]["bsz"]
     )
 
-    # Setup model
-    config["model"]["layer"]["l_max"] = l_max
-    model_cls = partial(
-        BatchStackedModel,
-        layer_cls=SSMLayer,
+    # Create model
+    model = StackedModel(
         d_output=n_classes,
+        d_model=config["model"]["d_model"],
+        n_layers=config["model"]["n_layers"],
+        layer_N=config["model"]["layer_N"],
+        l_max=l_max,
+        prenorm=config["model"]["prenorm"],
+        dropout=config["model"]["dropout"],
+        embedding=config["model"]["embedding"],
         classification=classification,
-        **config["model"]
-    )
-
-    # Create training state
-    state = create_train_state(
-        rng,
-        model_cls,
-        trainloader,
+    ).to(device)
+    
+    # Count parameters
+    n_params = count_parameters(model)
+    print(f"[*] Trainable Parameters: {n_params}")
+    
+    # Create optimizer and scheduler
+    optimizer = create_optimizer(
+        model, 
         lr=config["train"]["lr"],
-        lr_layer=getattr(SSMLayer, "lr", None),
-        lr_schedule=config["train"]["lr_schedule"],
-        weight_decay=config["train"]["weight_decay"],
-        total_steps=len(trainloader) * config["train"]["epochs"],
+        weight_decay=config["train"]["weight_decay"]
+    )
+    
+    total_steps = len(trainloader) * config["train"]["epochs"]
+    print(f"[*] Total training steps: {total_steps}")
+    
+    scheduler = create_scheduler(
+        optimizer, 
+        total_steps=total_steps,
+        lr_schedule=config["train"]["lr_schedule"]
     )
 
     # Training loop
-    best_loss, best_acc, best_epoch = 10000, 0, 0
+    best_loss, best_acc, best_epoch = float('inf'), 0, 0
+    
     for epoch in range(config["train"]["epochs"]):
         print(f"[*] Starting Training Epoch {epoch + 1}...")
-        state, train_loss, train_acc = train_epoch(
-            state, train_rng, model_cls, trainloader, classification=classification
+        train_loss, train_acc = train_epoch(
+            model, optimizer, scheduler, trainloader, 
+            classification=classification, device=device
         )
 
         print(f"[*] Running Epoch {epoch + 1} Validation...")
         test_loss, test_acc = validate(
-            state.params, model_cls, testloader, classification=classification
+            model, testloader, classification=classification, device=device
         )
 
         print(f"\n=>> Epoch {epoch + 1} Metrics ===")
@@ -552,6 +587,8 @@ def main(case="classification"):
             not classification and test_loss < best_loss
         ):
             best_loss, best_acc, best_epoch = test_loss, test_acc, epoch
+            # Save best model
+            torch.save(model.state_dict(), f"best_model_{case}.pt")
 
         print(
             f"\tBest Test Loss: {best_loss:.5f} -- Best Test Accuracy:"
